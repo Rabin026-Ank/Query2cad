@@ -1,11 +1,44 @@
 import os, sys, requests, re
-import pyautogui
 import time
-import pyperclip
 import logging
-from PIL import Image
 from prompts import *
 from llm import *
+from freecad_runner import run_macro
+
+# Prompts for the visual feedback loop. These replace the two local models the
+# paper used for the same two jobs: t2v_metrics VQAScore for the pass/fail gate
+# and BLIP2 flan-t5-xxl for the caption fed back into refinement.
+
+VQA_SCORE_PROMPT = """You are grading a CAD model that was generated from a text description.
+
+The image is an isometric render of the model, shown in FreeCAD on a white background.
+
+Requested design: {query}
+
+Judge only whether the rendered geometry matches the requested design: the shape,
+its features and the proportions implied by any stated dimensions. Ignore colour,
+lighting, camera angle and overall scale.
+
+Reply with JSON only:
+{{"score": <float 0.0-1.0>, "reason": "<one short sentence>"}}
+
+Use the full range: 1.0 is an exact match, 0.5 is the right family of shape with a
+clear feature or proportion wrong, 0.0 is unrelated or empty geometry."""
+
+CAPTION_PROMPT = """The image is an isometric render of a CAD model in FreeCAD.
+
+Describe only what you actually see, in one short noun phrase, the way you would
+complete the sentence "the CAD model generated resembles ...".
+
+State the shape and any obvious features or proportions, for example "a flat
+rectangular plate with a single circular hole near one edge" or "a cylinder that is
+much wider than it is tall". Do not guess intent, do not mention CAD software,
+colours or the background, and do not add any preamble.
+
+Remember that an isometric view stretches the vertical direction: a cube looks
+taller than it is wide in this projection. Only call out a proportion as unequal
+when it is clearly beyond that effect."""
+
 
 def get_queries(path):
     """
@@ -22,25 +55,33 @@ def write_macro(code, macro_path):
     Writes the generated macro in the specified path.
     """
 
+    os.makedirs(os.path.dirname(macro_path), exist_ok=True)
     with open(macro_path, 'w', encoding='utf-8') as file:
         file.write(code)
 
 def remove_backticks(text):
     """
-    Post processing on generated code output -- Removes the backticks present at the end of the code
+    Post processing on generated code output -- Extracts the code from the model reply.
+
+    The prompts end on an open ```python fence, so a reply arrives either as a
+    complete fenced block (chat models) or as bare code that closes a fence it
+    never opened (completion models).
     """
+
+    fenced = re.search(r"```(?:python|py|FCMacro)?[ \t]*\n(.*?)(?:```|\Z)", text, re.S)
+    if fenced:
+        return fenced.group(1).strip()
 
     pattern = r"```"
     matches = re.finditer(pattern, text)
     position = [m.start() for m in matches] #get the location of ```
-    start_position = 0
 
     try:
         end_position = position[0]
-        code = text[start_position:end_position].strip()
-    
+        code = text[0:end_position].strip()
+
     except:
-        code = text
+        code = text.strip()
 
     return code
 
@@ -48,62 +89,15 @@ def gui_sequence(macro_code_path, img_path):
     """
     Runs the entire sequence -- opening FreeCAD, running generated code, capturing the isometric image,
     returning the error code if there is any.
+
+    The macro is executed headlessly through freecadcmd rather than by driving the
+    FreeCAD window, so the run does not depend on screen resolution, window focus
+    or an idle desktop.
     """
-    
-    pyautogui.hotkey('win') #Open Run in windows
-    time.sleep(.5)
-    pyautogui.typewrite('FreeCAD')  
-    time.sleep(.5)
-    pyautogui.press('enter')  #Enter the pyautogui
-    logging.info('Opened FreeCAD software')
-    time.sleep(8)
-    pyautogui.hotkey('ctrl', 'o') #open the macro generated
-    time.sleep(3)
-    pyautogui.write(macro_code_path, interval=0.08)
-    time.sleep(3)
-    pyautogui.press('enter')
-    logging.info('Opened the macros')
-    time.sleep(1)
-    #pyautogui.moveTo(622, 75)
-    pyautogui.hotkey('ctrl', 'f6')#run the macro
-    '''time.sleep(2)
-    pyautogui.leftClick()'''
-    time.sleep(2)
-    
-    pyautogui.hotkey('v', 'f')
-    time.sleep(1)
-    pyautogui.hotkey('0')#orient the CAD model in isometric view
-    time.sleep(1)
-    screenshot = pyautogui.screenshot(region=(543, 147, 1050, 675))
-    screenshot.save(img_path)
 
-    pyperclip.copy('') #erases whatever is copied into clipboard initially
-
-    pyautogui.moveTo(1278, 929)
-    pyautogui.leftClick()
-    pyautogui.hotkey('ctrl', 'a')
-    pyautogui.hotkey('ctrl', 'c')
-
-    error_msg = pyperclip.paste() #if no error returns an empty string.
-    time.sleep(2)
-    '''pyautogui.hotkey('alt', 'f4')
-    time.sleep(1)
-    pyautogui.press('left')
-    pyautogui.press('left')
-    pyautogui.press('left')
-    pyautogui.press('left')
-    pyautogui.press('left')
-    pyautogui.press('enter') '''
-    pyautogui.hotkey('ctrl', 'alt', 't')
-    time.sleep(0.8)
-    pyautogui.write("pkill freecad", interval=0.08)
-    pyautogui.press("enter")
-    pyautogui.hotkey('alt', 'f4')
-
-    if error_msg == "":
-        error_msg = None
-    else:
-        error_msg = error_msg
+    logging.info('Executing macro %s', macro_code_path)
+    error_msg = run_macro(macro_code_path, img_path,
+                          timeout=int(os.getenv("FREECAD_TIMEOUT", "300")))
 
     return error_msg
 
@@ -120,11 +114,11 @@ def get_executable_code(gen_code, error, error_iter, model, api_key, temp, query
             updated_code = remove_backticks(updated_code)
             macro_path = f"results/code/query_{query_idx}_direct_attempt_{i}.FCMacro"
             write_macro(updated_code, macro_path)
-            # PyAutoGUI sequence
             img_path = f"results/images/query_{query_idx}_direct_attempt_{i}.png"
             error_msg = gui_sequence(macro_path, img_path)
 
             if error_msg is not None:
+                error = error_msg
                 continue
             else:
                 break
@@ -136,11 +130,11 @@ def get_executable_code(gen_code, error, error_iter, model, api_key, temp, query
             updated_code = remove_backticks(updated_code)
             macro_path = f"results/code/query_{query_idx}_refined_{refined_idx}_attempt_{i}.FCMacro"
             write_macro(updated_code, macro_path)
-            # PyAutoGUI sequence
             img_path = f"results/images/query_{query_idx}_refined_{refined_idx}_attempt_{i}.png"
             error_msg = gui_sequence(macro_path, img_path)
 
             if error_msg is not None:
+                error = error_msg
                 continue
             else:
                 break
@@ -150,35 +144,44 @@ def get_executable_code(gen_code, error, error_iter, model, api_key, temp, query
 def get_vqa_score(img_path, user_query, model):
     """
     Gets the VQA score between the generated model and user query.
-    Reference: https://github.com/linzhiqiu/t2v_metrics
+
+    `model` is the name of the vision model doing the grading.
     """
 
-    text = f"This image shows a CAD model of {user_query}"
-    score = model(images = [img_path], texts = [text])
-    return score.item()
+    api_key = os.getenv("GEMINI_API_KEY", "")
+    prompt = VQA_SCORE_PROMPT.format(query=user_query.strip())
+
+    try:
+        data = get_json_answer(model, api_key, prompt, img_path)
+        score = float(data.get("score", 0.0))
+        reason = str(data.get("reason", "")).strip()
+    except Exception as exc:
+        # A grading failure must not abort the run; treat it as "needs refinement".
+        print(f"  [vqa] scoring failed ({exc}); treating as 0.0")
+        return 0.0
+
+    score = max(0.0, min(1.0, score))
+    print(f"  [vqa] score {score:.2f} -- {reason}")
+
+    return score
 
 def get_captions(img_path, processor, model, human_feedback):
     """
     Gets the caption of the image
+
+    `processor` is retained for signature compatibility with the BLIP2 version
+    and is unused. `model` is the name of the vision model.
     """
 
-    raw_img = Image.open(img_path).convert('RGB')
-
-    # Conditional captioning
-    #text = "This image shows the CAD model of a "
-    #inputs = processor(raw_img, text, return_tensors="pt").to("cuda")
-
-    #question = "The image is a CAD model of an object. Describe the object briefly"
-    inputs = processor(raw_img, return_tensors="pt").to("cuda")
-    out = model.generate(**inputs)
-
-    caption = processor.decode(out[0], skip_special_tokens = True)
+    api_key = os.getenv("GEMINI_API_KEY", "")
+    caption = get_answers_with_image(model, api_key, CAPTION_PROMPT, img_path, 0.2)
+    caption = caption.strip().strip('"').rstrip('.')
 
     print('System generated caption: ', caption)
 
     if human_feedback != False:
         proceed = input("Do you want to proceed with the system generated caption? Type fp for vqa score false negative (y/n/fn): ")
-  
+
         if proceed == 'y' or proceed == 'Y':
             caption = caption
 
@@ -193,7 +196,7 @@ def get_captions(img_path, processor, model, human_feedback):
 
     return caption
 
-def get_refined_outputs(captions, user_query, prev_code, refine_iter, model, api_key, temp, 
+def get_refined_outputs(captions, user_query, prev_code, refine_iter, model, api_key, temp,
                         query_idx, error_iter, vqa_model, vqa_thresh, processor, caption_model, base_url, human_feedback):
     """
     Performs iterative refinement and gets the best possible output for a given user query
@@ -211,7 +214,6 @@ def get_refined_outputs(captions, user_query, prev_code, refine_iter, model, api
         refined_code = remove_backticks(refined_code)
         macro_path = f"results/code/query_{query_idx}_refined_{i}_attempt_0.FCMacro"
         write_macro(refined_code, macro_path)
-        # GUI sequence
         img_path = f"results/images/query_{query_idx}_refined_{i}_attempt_0.png"
         error_msg = gui_sequence(macro_path, img_path)
         print('error_msg', error_msg)
@@ -221,7 +223,6 @@ def get_refined_outputs(captions, user_query, prev_code, refine_iter, model, api
                 img_path_for_captions = f"results/images/query_{query_idx}_refined_{i}_attempt_{success_idx}.png"
             else:
                 print("Refinement failed... Skipping to next query")
-                # TODO: Add some placeholders to return
                 break
 
         else:
@@ -240,5 +241,3 @@ def get_refined_outputs(captions, user_query, prev_code, refine_iter, model, api
         elif vqa_score >= vqa_thresh:
             print(f"Refinement was successful for query {query_idx} in refine attempt {i}...")
             break
-
-    

@@ -1,0 +1,7 @@
+# The pipeline talks to the model APIs over plain HTTP and drives FreeCAD through
+# its own bundled Python, so this is the whole dependency list.
+requests>=2.31.0
+
+# Only needed for the backends from the paper:
+#   openai      -- chatgpt, gpt4-turbo
+#   together    -- codellama, llama3 (the calls are plain HTTP, no SDK required)

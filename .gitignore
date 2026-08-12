@@ -1,16 +1,7 @@
 # Credentials -- never commit these
 .env
-.env.*
 *.env
 !.env.example
-!local_run/.env.example
-
-# Generated run artefacts
-local_run/output/
-results/code/*
-results/images/*
-!results/code/.gitkeep
-!results/images/.gitkeep
 
 # Python
 __pycache__/
@@ -23,3 +14,6 @@ venv/
 .claude/
 .vscode/
 .idea/
+
+# results/ is tracked: it holds the macros and renders published with the paper.
+# Note that a run writes into it by query index and will overwrite them.
