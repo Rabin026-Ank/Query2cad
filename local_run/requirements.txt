@@ -1,0 +1,3 @@
+# The local pipeline talks to both APIs over plain HTTP and drives FreeCAD
+# through its own bundled Python, so this is the whole dependency list.
+requests>=2.31.0
